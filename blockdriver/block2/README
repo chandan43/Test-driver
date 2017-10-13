@@ -1,0 +1,36 @@
+Block Driver
+
+1. Compilation :
+   make 
+2. Load module using insmod
+   insmod sbd.ko
+
+3.  fdisk /dev/sbd0
+Command (m for help): n
+Command action
+   e   extended
+      p   primary partition (1-4)
+      p
+      Partition number (1-4):   1
+      First cylinder (1-16, default 1): ^
+      Using default value 1 :^
+      Last cylinder, +cylinders or +size{K,M,G} (1-16, default 16):^
+      Using default value 16 : ^
+
+      Command (m for help): w
+      The partition table has been altered!
+
+Note : ^ = blank Space
+4. mkfs /dev/sbd0p1
+
+5.mount /dev/sbd0p1 /mnt
+
+6.echo Hi > /mnt/file1
+
+7.cat /mnt/file1
+
+8.ls -l /mnt
+
+9.umount /mnt
+
+10.rmmod sbd

@@ -1,0 +1,16 @@
+!_TAG_FILE_FORMAT	2	/extended format; --format=1 will not append ;" to lines/
+!_TAG_FILE_SORTED	1	/0=unsorted, 1=sorted, 2=foldcase/
+!_TAG_PROGRAM_AUTHOR	Darren Hiebert	/dhiebert@users.sourceforge.net/
+!_TAG_PROGRAM_NAME	Exuberant Ctags	//
+!_TAG_PROGRAM_URL	http://ctags.sourceforge.net	/official site/
+!_TAG_PROGRAM_VERSION	5.8	//
+ADDRESS_REG	rtc.h	10;"	d
+DATA_REG	rtc.h	11;"	d
+DAY	rtc.h	6;"	d
+HOUR	rtc.h	4;"	d
+MIN	rtc.h	3;"	d
+MONTH	rtc.h	7;"	d
+SEC	rtc.h	2;"	d
+WEEK	rtc.h	5;"	d
+YEAR	rtc.h	8;"	d
+main	urtc.c	/^int main(int argc,char **argv){$/;"	f

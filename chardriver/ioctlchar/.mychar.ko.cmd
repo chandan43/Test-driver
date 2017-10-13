@@ -1,0 +1,1 @@
+cmd_/home/test_driver/chardriver/ioctlchar/mychar.ko := ld -r -m elf_x86_64 -T ./scripts/module-common.lds --build-id  -o /home/test_driver/chardriver/ioctlchar/mychar.ko /home/test_driver/chardriver/ioctlchar/mychar.o /home/test_driver/chardriver/ioctlchar/mychar.mod.o

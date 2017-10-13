@@ -1,0 +1,1 @@
+cmd_/home/test_driver/kobject/kobj.ko := ld -r -m elf_x86_64 -T ./scripts/module-common.lds --build-id  -o /home/test_driver/kobject/kobj.ko /home/test_driver/kobject/kobj.o /home/test_driver/kobject/kobj.mod.o
