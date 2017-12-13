@@ -2,9 +2,10 @@
 #include <linux/init.h>
 
 extern int myvar;
-
+extern int test_fun(int); 
 int myinit(void){
 	printk("%s: My first dependent driver ,and variable val=%d\n",__func__,myvar);
+	test_fun(10);
 	return 0;
 }
 

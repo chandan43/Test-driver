@@ -1,7 +1,7 @@
 obj-m := mfd.o
 obj-m += mfdd.o
 #obj-m += modparam.o
-obj-m += mfdd_indir.o
+#obj-m += mfdd_indir.o
 
 KDIR=/lib/modules/$(shell uname -r )/build
 
