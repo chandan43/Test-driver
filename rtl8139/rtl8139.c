@@ -7,7 +7,8 @@
 #include <linux/io.h>
 #include <linux/interrupt.h>
 #include <linux/types.h>
-
+#include <linux/rtnetlink.h>
+#include <linux/delay.h>
 #include "rtl_register.h"
 
 #define DRV_NAME "8139too"
@@ -15,6 +16,11 @@
 #define NUM_TX_DESC 4
 #define RTL8139_DRIVER_NAME   DRV_NAME " Fast Ethernet driver " DRV_VERSION
 
+/* write MMIO register, with flush */
+/* Flush avoids rtl8139 bug w/ posted MMIO writes */
+#define RTL_W8_F(reg, val8)	do { iowrite8 ((val8), ioaddr + (reg)); ioread8 (ioaddr + (reg)); } while (0)
+#define RTL_W16_F(reg, val16)	do { iowrite16 ((val16), ioaddr + (reg)); ioread16 (ioaddr + (reg)); } while (0)
+#define RTL_W32_F(reg, val32)	do { iowrite32 ((val32), ioaddr + (reg)); ioread32 (ioaddr + (reg)); } while (0)
 /* write MMIO register */
 #define RTL_W8(reg, val8)   iowrite8 ((val8), ioaddr + (reg))
 #define RTL_W16(reg, val16) iowrite16 ((val16), ioaddr + (reg))
@@ -39,108 +45,181 @@ struct rtl8139_priv {
 	unsigned char *rx_ring;
 	dma_addr_t rx_ring_dma;
 	unsigned int cur_rx;
+	struct napi_struct	napi; /* Structure for NAPI scheduling similar to tasklet but with weighting */ 
+	struct net_device	*dev; /*  The NET DEVICE structure.*/
+    unsigned long   fifo_copy_timeout;
 };
+
+static int rtl8139_rx(struct net_device *dev, struct rtl8139_priv *tp,
+		      int budget)
+{
+	void __iomem *ioaddr = tp->mmio_addr;
+	int received = 0;
+	unsigned char *rx_ring = tp->rx_ring;
+	unsigned int cur_rx = tp->cur_rx;
+	unsigned int rx_size = 0;
+	
+    while (netif_running(dev) && received < budget &&
+	       (RTL_R8 (CR) & 0x01) == 0) {
+		u32 ring_offset = cur_rx % RX_BUF_LEN;
+		u32 rx_status;
+		unsigned int pkt_size;
+		struct sk_buff *skb;
+		
+		rmb();
+		/* read size+status of next frame from DMA ring buffer */
+		rx_status = le32_to_cpu (*(__le32 *) (rx_ring + ring_offset));
+		rx_size = rx_status >> 16;              /* status : First 16 bit */
+		if (likely(!(dev->features & NETIF_F_RXFCS)))       /*Axpend FCS to skb pkt data */
+			pkt_size = rx_size - 4;  /* first two bytes are receive status register*/
+		else 
+			pkt_size = rx_size;
+        if (unlikely(rx_size == 0xfff0)) {
+			if (!tp->fifo_copy_timeout)
+				    tp->fifo_copy_timeout = jiffies + 2;
+ 		/* time_after(a,b) returns true if the time a is after time b.*/
+			else if (time_after(jiffies, tp->fifo_copy_timeout)) {
+				netdev_dbg(dev, "hung FIFO. Reset\n");
+				rx_size = 0;
+				goto no_early_rx;
+			}
+			break;
+		 }
+no_early_rx:
+		tp->fifo_copy_timeout = 0;
+		/* Malloc up new buffer, compatible with net-2e. */
+		/* Omit the four octet CRC from the length. */
+		skb = napi_alloc_skb(&tp->napi, pkt_size);
+		if (likely(skb)) {
+			skb_copy_to_linear_data (skb, &rx_ring[ring_offset + 4], pkt_size);  //memcpy(skb->data, from, len);
+			
+            skb_put (skb, pkt_size); /*  add data to a buffer */
+			skb->protocol = eth_type_trans (skb, dev); /*  determine the packet's protocol ID. */
+			netif_receive_skb (skb);/* process receive buffer from network */	
+		}
+		received++;
+		/* update tp->cur_rx to next writing location  */
+		
+		cur_rx = (cur_rx + rx_size + 4 + 3) & ~3;              /*  ~3 : First two bytes are receive status register*/ 
+		RTL_W16 (CAPR, (u16) (cur_rx - 16));               /* 16 byte align the IP fields  */
+		
+	}
+	
+	tp->cur_rx = cur_rx;
+	if (tp->fifo_copy_timeout)
+		received = budget;
+	return received;	
+}
+static int rtl8139_poll(struct napi_struct *napi, int budget)
+{
+	struct rtl8139_priv *tp = container_of(napi, struct rtl8139_priv, napi);
+	struct net_device *dev = tp->dev;
+	void __iomem *ioaddr = tp->mmio_addr;
+	int work_done;
+    pr_info("%s##\n",__func__);
+	work_done = 0;
+	if (likely(RTL_R16(ISR) & RxOK))  /*if RxIFOOver | RxOverflow | RxOK is set then work_done ++ */
+		work_done += rtl8139_rx(dev, tp, budget);
+	
+	if (work_done < budget) {
+		/*
+		 * Order is important since data can get interrupted
+		 * again when we think we are done.
+		 */
+		__napi_complete(napi);                   //NAPI processing complete
+	}
+
+	return work_done;
+}
+static void rtl8139_tx_interrupt (struct net_device *dev,
+				  struct rtl8139_priv *tp,
+				  void __iomem *ioaddr)
+{
+	unsigned long dirty_tx, tx_left;
+
+	dirty_tx = tp->dirty_tx;
+	tx_left = tp->cur_tx - dirty_tx;
+	pr_info("dirty_tx : %d and tx_left : %d\n",dirty_tx,tx_left);
+    msleep(100000);
+	while (tx_left > 0) {
+        if(printk_ratelimit()) {
+                pr_info("::::->>>%d\n",tx_left);
+        }
+		int entry = dirty_tx % NUM_TX_DESC;
+		int txstatus;
+		txstatus = RTL_R32 (TSD0 + (entry * sizeof (u32)));  /* TxStatus0 + entry(0-3) * discriptor size*/
+		if (!(txstatus & (TxStatOK | TxUnderrun | TxAborted)))
+			    break;	/* It still hasn't been Txed */
+		/* Note: TxCarrierLost is always asserted at 100mbps. */
+		if (txstatus & (TxOutOfWindow | TxAborted)) {
+			/* There was an major error, log it. */
+			dev->stats.tx_errors++;
+			if (txstatus & TxAborted) {
+				dev->stats.tx_aborted_errors++;
+				RTL_W16 (ISR, TxErr);
+				wmb();                                    /*The wmb() macro does: prevent reordering of the stores. */
+			}
+			if (txstatus & TxCarrierLost)
+				dev->stats.tx_carrier_errors++;
+			if (txstatus & TxOutOfWindow)
+				dev->stats.tx_window_errors++;
+		} else {
+			if (txstatus & TxUnderrun) {
+				/* Add 64 to the Tx FIFO threshold. */
+				if (tp->tx_flag < 0x00300000)      /*if Collision Count*/
+					tp->tx_flag += 0x00020000; /*Threshold level in the Tx FIFO is increased*/
+				dev->stats.tx_fifo_errors++;
+			}
+			dev->stats.collisions += (txstatus >> 24) & 15;  /*right shit 24 times i.e Number of Collision Count & (0001(collision signal)0101 (Collision Count) ) i.e 15*/
+		}
+		dirty_tx++;
+		tx_left--;
+	}
+	/* only wake the queue if we did work, and the queue is stopped */
+	if (tp->dirty_tx != dirty_tx) {
+		tp->dirty_tx = dirty_tx;
+		mb();
+		netif_wake_queue (dev); /* restart transmit */
+	} 
+    pr_info("At End###########################--->\n");
+}
 static irqreturn_t rtl8139_interrupt(int irq, void *dev_instance){
 	struct net_device *dev = (struct net_device * ) dev_instance;
 	struct rtl8139_priv *priv = netdev_priv(dev);
     void __iomem *ioaddr = priv->mmio_addr;
-    pr_info("%s ioaddr  %p\n",__func__,ioaddr);
-    //unsigned short isr = readw(ioaddr + ISR);
+  //  unsigned short isr1 = readw(ioaddr + ISR);
     unsigned short isr = RTL_R16(ISR);
     int handled = 0;
-    
-     netdev_dbg(dev, "------>exiting interrupt, intr_status=%#4.4x\n",
-           RTL_R16(ISR));
     /* h/w no longer present (hotplug?) or major error, bail */
     if (unlikely(isr == 0xFFFF))
         goto out;
     handled = 1;
+	if (unlikely(!netif_running(dev))) {
+		RTL_W16 (IMR, 0);
+		goto out;
+	}
    /* clear all interrupt.
     * Specs says reading ISR clears all interrupts and writing
     * has no effect. But this does not seem to be case. I keep on
     * getting interrupt unless I forcibly clears all interrupt :-(
     */	
 	pr_debug("rtl8139_interrupt: \n");
-    writew(0xffff,ioaddr + ISR);
-	if((isr & TxOK) || (isr & TxErr)){
-		while((priv->dirty_tx != priv->cur_tx ) && netif_queue_stopped(dev)){
-			unsigned int txstatus = readl(ioaddr + TSD0 + priv->dirty_tx * sizeof(int));
-			/* not yet transmitted */
-			if(!(txstatus & (TxStatOK |TxAborted | TxUnderrun))) break;
-			if(txstatus & TxStatOK){
-				pr_info("Transmit OK interrupt\n");
-				priv->stats.tx_bytes += (txstatus & 0x1fff);
-				priv->stats.tx_packets++;
-			}
-			else{
-				pr_err("Transmit Error interrupt\n");
-				priv->stats.tx_errors++;
-			}
-			priv->dirty_tx++;
-			priv->dirty_tx = priv->dirty_tx % NUM_TX_DESC;
-			if ((priv->dirty_tx == priv->cur_tx) & netif_queue_stopped(dev)) {
-				pr_info("waking up queue\n");
-				 netif_wake_queue(dev);
-			}
-		}
-	}
+//    writew(0xffff,ioaddr + ISR);
 	if(isr & RxErr){
 		pr_err("receive err interrupt\n");
 		priv->stats.rx_errors++;
 	}
 	if(isr & RxOK ){
 		pr_info("receive interrupt received\n");
-		while((readb(ioaddr + CR) & RxBufEmpty)==0){ /*We read from the receiver buffer until we have read all data.*/
-			unsigned int rx_status;
-			unsigned short rx_size;
-			unsigned short pkt_size;
-			struct sk_buff *skb;
-			if(priv->cur_rx > RX_BUF_LEN){
-				priv->cur_rx = priv->cur_rx % RX_BUF_LEN;
-				/* Need to convert rx_status from little to host endian*/
-				rx_status = *(unsigned int *)(priv->rx_ring + priv->cur_rx);
-				rx_size = rx_status >> 16;
-				/* first two bytes are receive status register 
-				 ** and next two bytes are frame length  */
-				pkt_size = rx_size - 4;
-				/* hand over packet to system */
-/*
- * The networking layer reserves some headroom in skb data (via
- * dev_alloc_skb). This is used to avoid having to reallocate skb data when
- * the header has to grow. In the default case, if the header has to grow
- * 32 bytes or less we avoid the reallocation.*/
-/**
- *      skb_reserve - adjust headroom
- *      @skb: buffer to alter
- *      @len: bytes to move
- *
- *      Increase the headroom of an empty &sk_buff by reducing the tail
- *      room. This is only allowed for an empty buffer.
- */
-				skb=dev_alloc_skb(pkt_size+2);
-				if(skb){
-					skb->dev=dev;
-					skb_reserve (skb, 2); /* 16 byte align the IP fields */
-			//		eth_copy_and_sum(skb, priv->rx_ring + priv->cur_rx + 4, pkt_size, 0);
-					memcpy(skb, priv->rx_ring + priv->cur_rx + 4, pkt_size);
-					skb_put(skb,pkt_size);                 //add data to a buffer 
-					skb->protocol=eth_type_trans(skb,dev);
-					/* netif_rx, which hands off the socket buffer to the upper layers*/
-					netif_rx (skb);
-					dev->last_rx = jiffies;/*You need to read the current counter whenever your code needs to calculate a future time stamp*/
-					priv->stats.rx_bytes += pkt_size;
-					priv->stats.rx_packets++;
-				}
-				else{
-					pr_info("Memory squeeze, dropping packet.\n");
-					priv->stats.rx_dropped++;
-				}
-				/* update tp->cur_rx to next writing location  */
-				priv->cur_rx = (priv->cur_rx + rx_size + 4 + 3) & ~3;
-				/* update CAPR((Current Address of Packet Read)) */
-				writew(priv->cur_rx, ioaddr + CAPR);
-			}
-		}
+		if (napi_schedule_prep(&priv->napi)) {
+			__napi_schedule(&priv->napi);
+        }
+	}
+	if (isr & (TxOK | TxErr)) {
+		pr_info("Tx  interrupt received\n");
+		rtl8139_tx_interrupt (dev, priv, ioaddr);
+		if (isr & TxErr)
+			RTL_W16 (ISR, TxErr);
 	}
 	 if(isr & CableLen) pr_err("cable length change interrupt\n");
 	 if(isr & TimeOut) pr_err("time interrupt\n");
@@ -185,7 +264,7 @@ static void rtl8139_hw_start (struct net_device *dev) {
 	pr_debug("rtl8139_hw_start: \n");
 	rtl8139_chip_reset(ioaddr);
 	/* Must enable Tx/Rx before setting transfer thresholds! */
-	writeb(CmdTxEnb|CmdRxEnb, ioaddr + CR);
+	writeb(CmdTxEnb|CmdrxEnb, ioaddr + CR);
 	 /* tx config */
 	writel(0x00000600, ioaddr + TCR); /* DMA burst size 1024 */
 	/* rx config */
@@ -197,21 +276,30 @@ static void rtl8139_hw_start (struct net_device *dev) {
 	 *Bit 8-10 - Max DMA burst size per Rx DMA burst. We are configuring this to 111, which means unlimited.
 	 *Bit 11-12 - Rx buffer length. We are configuring to 10 which means 32K+16 bytes. */
 	 writel((1<<1)|(1<<2)|(1<<3)|(1<<7)|(7<<8)|(11<<3),ioaddr + RCR); 
+	priv->cur_rx = 0;
+	/* init Rx ring buffer DMA address */
+	RTL_W32_F (RBSTART, priv->rx_ring_dma);
 	/* init Tx buffer DMA addresses */
-	for(i=0;i<NUM_TX_DESC;i++){
-		writel(priv->tx_bufs_dma+(priv->tx_buf[i]- priv->tx_bufs),ioaddr + TSAD0 + (i*4));
-	}
-	  /* init RBSTART */
-	writel(priv->rx_ring_dma, ioaddr + RBSTART);
+	/* init Tx buffer DMA addresses */
+	for (i = 0; i < NUM_TX_DESC; i++)
+		RTL_W32_F (TSAD0 + (i * 4), priv->tx_bufs_dma + (priv->tx_buf[i] - priv->tx_bufs));
+//	for(i=0;i<NUM_TX_DESC;i++){
+//		writel(priv->tx_bufs_dma+(priv->tx_buf[i]- priv->tx_bufs),ioaddr + TSAD0 + (i*4));
+//	}
+	/* init RBSTART */
+//	writel(priv->rx_ring_dma, ioaddr + RBSTART);
 	/* initialize missed packet counter */
 	writel(0, ioaddr + MPC);
+    
+	int tmp = RTL_R8 (CR);
+	if ((!(tmp & CmdRxEnb)) || (!(tmp & CmdTxEnb)))
+		RTL_W8 (CR, CmdRxEnb | CmdTxEnb);
 	/* no early-rx interrupts. Configure the device for not generating early interrupts.*/
 	writew((readw(ioaddr + MULINT) & 0xF000), ioaddr + MULINT);
 	/* Enable all known interrupts by setting the interrupt mask. */
 	writel(INT_MASK,ioaddr + IMR);
-	netif_start_queue (dev); // allow transmit
 }
-
+#define TX_FIFO_THRESH 256
 static int rtl8139_open(struct net_device *dev){
 	int retval;
 	struct rtl8139_priv *tc=netdev_priv(dev);
@@ -251,41 +339,59 @@ static int rtl8139_open(struct net_device *dev){
 		}
 		return -ENOMEM;
 	}
-	tc->tx_flag=0;
+	//tc->tx_flag=0;
+	tc->tx_flag=(TX_FIFO_THRESH << 11) & 0x003f0000;;
+	napi_enable(&tc->napi);  /*enable NAPI scheduling*/
 	rtl8139_init_ring(dev);
 	rtl8139_hw_start(dev);
+	netif_start_queue (dev); // allow transmit
 	return 0;
 }
 
 static int rtl8139_stop(struct net_device *dev){
 	struct rtl8139_priv *priv = netdev_priv(dev);
 	struct pci_dev *pdev= priv->pci_dev;
+    void __iomem *ioaddr = priv->mmio_addr;
+	netif_stop_queue(dev);  /*Stop transmitted packets*/
+	napi_disable(&priv->napi);
+	/* Stop the chip's Tx and Rx DMA processes. */
+	RTL_W8 (CR, 0);
+	
+	/* Disable interrupts by clearing the interrupt mask. */
+	RTL_W16 (IMR, 0);
+	
+	//RTL_W32 (RxMissed, 0);
 	free_irq(pdev->irq, dev);
+	priv->cur_tx = 0;
+	priv->dirty_tx = 0;
 //	pci_free_consistent(priv->pci_dev,TOTAL_TX_BUF_SIZE,priv->tx_bufs,priv->tx_bufs_dma);
 //	pci_free_consistent(priv->pci_dev,RX_BUF_TOT_LEN,priv->rx_ring,priv->rx_ring_dma);
 	dma_free_coherent(&priv->pci_dev->dev, TOTAL_TX_BUF_SIZE,
 			                        priv->tx_bufs, priv->tx_bufs_dma);
     dma_free_coherent(&priv->pci_dev->dev, RX_BUF_TOT_LEN,
                         priv->rx_ring, priv->rx_ring_dma);
-	priv->cur_tx = 0;
-	priv->rx_ring = 0;
+	priv->rx_ring = NULL;
+	priv->tx_bufs = NULL;
 	pr_info("rtl8139 Device Stoped\n");
-	return 0;
+	
+    return 0;
 }
 
 static int rtl8139_start_xmit(struct sk_buff *skb,struct net_device *dev){
 	struct rtl8139_priv *priv = netdev_priv(dev);
 	void __iomem *ioaddr = priv->mmio_addr;
-	unsigned int entry = priv->cur_tx;
+	unsigned int entry = priv->cur_tx  % NUM_TX_DESC;
 	unsigned int len = skb->len;
 	pr_debug("rtl8139_start_xmit: \n");
 	if (len < TX_BUF_SIZE) {
 		if(len<ETH_MIN_LEN) memset(priv->tx_buf[entry],0,ETH_MIN_LEN);
 		skb_copy_and_csum_dev(skb,priv->tx_buf[entry]); // which copies the packet contents to the DMA capable memory.
-		dev_kfree_skb(skb);
+		dev_kfree_skb_any(skb);
+		//dev_kfree_skb(skb);
 	}
 	else{
-		dev_kfree_skb(skb);
+		dev_kfree_skb_any(skb);
+		//dev_kfree_skb(skb);
         dev->stats.tx_dropped++;
 		return 0;
 	}
@@ -367,9 +473,11 @@ static int rtl8139_init_one(struct pci_dev *pdev,
 		pr_err("Couldn't ioremap\n");
 		goto cleanup2;
 	}
+	netif_napi_add(ndev, &priv->napi, rtl8139_poll, 64); /* Initialize a NAPI context */	
 	ndev->base_addr=(long)ioaddr;
 	priv->mmio_addr=ioaddr;
 	priv->regs_len=mmio_len;
+    priv->dev = ndev; 
 	/* UPDATE NET_DEVICE */
 	for(i=0;i<6;i++){ /* Hardware Address */
 		ndev->dev_addr[i]=readb((const volatile void *)ndev->base_addr + i);
@@ -388,6 +496,7 @@ static int rtl8139_init_one(struct pci_dev *pdev,
     pci_set_drvdata (pdev, ndev);
 	return 0;
 cleanup0: 
+	 netif_napi_del(&priv->napi); /* remove a napi context */
 	 free_netdev(ndev);
 //cleanup1:
      if (priv->mmio_addr)
@@ -402,11 +511,12 @@ static void rtl8139_remove_one(struct pci_dev *pdev)
 {
 	struct net_device *dev = pci_get_drvdata (pdev);
     struct rtl8139_priv *priv = netdev_priv(dev);   /* rtl8139 private information */
-    pr_info("%s ioaddr  %p\n",__func__,priv->mmio_addr);
-    if (priv->mmio_addr)
-	    iounmap(priv->mmio_addr);
-	pci_release_regions(pdev);
+	netif_napi_del(&priv->napi);
 	unregister_netdev(dev);
+    if (priv->mmio_addr)
+		pci_iounmap (pdev, priv->mmio_addr);
+	pci_release_regions(pdev);
+	free_netdev(dev);
 	pci_disable_device(pdev);
 	printk("%s: Cleanup module is executed well\n",__func__);
 }

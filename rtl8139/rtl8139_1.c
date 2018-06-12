@@ -10,8 +10,6 @@
 #include <linux/delay.h>
 #include <linux/kernel.h>
 #include <linux/interrupt.h>
-#include <linux/rtnetlink.h>
-#include <linux/completion.h>
 #include <linux/completion.h>
 #include <linux/crc32.h>
 #include <linux/io.h>
@@ -194,16 +192,16 @@ enum RTL8139_registers {
 	Config0		= 0x51,  /* Configuration Register 0*/
 	Config1		= 0x52,  /* Configuration Register 1*/
 	TimerInt	= 0x54,  /* Timer Interrupt Register.*/
-	MediaStatus	= 0x58,  /* Media Status Register*/
-	Config3		= 0x59,  /* Configuration register 3*/
-	Config4		= 0x5A,	 /* absent on RTL-8139A  : Configuration register 4*/
-	HltClk		= 0x5B,  /* Reserved*/
-	MultiIntr	= 0x5C,  /* Multiple Interrupt Select*/
-	TxSummary	= 0x60,  /* Transmit Status of All Descriptors*/
+	MediaStatus	    = 0x58,  /* Media Status Register*/
+	Config3		    = 0x59,  /* Configuration register 3*/
+	Config4		    = 0x5A,	 /* absent on RTL-8139A  : Configuration register 4*/
+	HltClk		    = 0x5B,  /* Reserved*/
+	MultiIntr	    = 0x5C,  /* Multiple Interrupt Select*/
+	TxSummary	    = 0x60,  /* Transmit Status of All Descriptors*/
 	BasicModeCtrl	= 0x62,  /* Basic Mode Control Register*/
 	BasicModeStatus	= 0x64,  /* Basic Mode Status Register*/
-	NWayAdvert	= 0x66,  /* Auto-Negotiation Advertisement Register*/
-	NWayLPAR	= 0x68,  /* Auto-Negotiation Link Partner Register*/
+	NWayAdvert	    = 0x66,  /* Auto-Negotiation Advertisement Register*/
+	NWayLPAR	    = 0x68,  /* Auto-Negotiation Link Partner Register*/
 	NWayExpansion	= 0x6A,  /* Auto-Negotiation Expansion Register*/
 	/* Undocumented registers, but required for proper operation. */
 	FIFOTMS		= 0x70,	 /* FIFO Control and test. : N-way Test Register*/
@@ -249,11 +247,11 @@ enum IntrStatusBits {
   6. BIT : 31 R CRS    : Carrier Sense Lost: This bit is set to 1 when the carrier is lost during transmission of a packet.   
 */ 
 enum TxStatusBits {
-	TxHostOwns	= 0x2000, 
-	TxUnderrun	= 0x4000, 
-	TxStatOK	= 0x8000,
+	TxHostOwns	    = 0x2000, 
+	TxUnderrun	    = 0x4000, 
+	TxStatOK	    = 0x8000,
 	TxOutOfWindow	= 0x20000000,
-	TxAborted	= 0x40000000,
+	TxAborted	    = 0x40000000,
 	TxCarrierLost	= 0x80000000,
 };
 /*

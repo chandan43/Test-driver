@@ -51,5 +51,6 @@
 
 #define INT_MASK (RxOK | RxErr | TxOK | TxErr | \
                RxOverFlow | RxUnderrun | RxFIFOOver | \
-               CableLen | TimeOut | SysErr)
+               TimeOut | SysErr)
+              // CableLen | TimeOut | SysErr)
 

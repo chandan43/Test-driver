@@ -1,4 +1,7 @@
+#obj-m := rtl8139_1.o
 obj-m := rtl8139.o
+CFLAGS_rtl8139.o := -DDEBUG
+
 
 KDIR=/lib/modules/$(shell uname -r )/build
 
